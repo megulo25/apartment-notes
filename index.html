@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Apartment Notes</title>
+  <meta name="description" content="Personal feedback journal for apartments you've toured." />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏠</text></svg>" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand" id="homeLink">🏠 <span>Apartment Notes</span></div>
+    <div class="topbar-actions">
+      <button class="btn ghost" id="settingsBtn" title="Requirements & backup">⚙︎ Settings</button>
+      <button class="btn primary" id="newBtn">+ New visit</button>
+    </div>
+  </header>
+
+  <main id="app"></main>
+
+  <!-- Settings dialog -->
+  <dialog id="settingsDialog">
+    <form method="dialog" class="dialog-body" id="settingsForm">
+      <h2>My requirements</h2>
+      <p class="muted">These are checked against every apartment. One per line.</p>
+      <textarea id="reqText" rows="8" placeholder="In-unit washer/dryer&#10;Parking&#10;Pet friendly"></textarea>
+
+      <h2>Backup &amp; sync</h2>
+      <p class="muted">Your notes are saved in this browser only. Export a backup to keep it safe or move it to another device (phone ↔ laptop), then import it there.</p>
+      <div class="row">
+        <button type="button" class="btn" id="exportBtn">⬇ Export backup</button>
+        <label class="btn">⬆ Import backup<input type="file" id="importInput" accept="application/json" hidden /></label>
+      </div>
+
+      <div class="row end">
+        <button class="btn ghost" value="cancel">Cancel</button>
+        <button class="btn primary" value="save" id="saveSettings">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Lightbox -->
+  <dialog id="lightbox" class="lightbox">
+    <img id="lightboxImg" alt="" />
+    <form method="dialog"><button class="btn lb-close">✕</button></form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
