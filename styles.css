@@ -195,3 +195,21 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
   .brand span { display: none; }
   .hero { aspect-ratio: 4/3; }
 }
+
+/* Voice */
+.voice-panel { border-color: var(--accent); }
+.btn.recording { background: var(--bad); border-color: var(--bad); color: #fff; animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .75; } }
+.rec-timer { font-variant-numeric: tabular-nums; font-weight: 600; }
+.voice-status { margin-top: 12px; padding: 10px 12px; border-radius: 10px; background: var(--accent-soft); font-size: .92rem; }
+.voice-status.ok { background: var(--good-soft); color: var(--good); }
+.voice-status.err { background: var(--bad-soft); color: var(--bad); }
+.voice-status.warn { background: var(--warn-soft); color: var(--warn); }
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; vertical-align: -2px; margin-right: 6px; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.rec-heading { font-size: .95rem; margin: 16px 0 8px; }
+.rec-item { border-top: 1px solid var(--line); padding: 10px 0; display: flex; flex-direction: column; gap: 6px; }
+.rec-item audio { width: 100%; height: 36px; }
+.rec-item summary { cursor: pointer; color: var(--accent); font-size: .9rem; }
+.filled { animation: filled 2.4s ease-out; }
+@keyframes filled { 0%, 40% { box-shadow: 0 0 0 3px var(--accent); background-color: var(--accent-soft); } 100% { box-shadow: 0 0 0 0 transparent; } }

@@ -145,6 +145,157 @@
   }
   $('#lightbox').addEventListener('click', e => { if (e.target.id === 'lightbox') $('#lightbox').close(); });
 
+  // ---------- Voice: transcription (on-device Whisper in a worker) ----------
+  let worker = null;
+  let jobSeq = 0;
+  const jobs = new Map();
+  let progressListener = null;
+
+  function getWorker() {
+    if (worker) return worker;
+    worker = new Worker('transcribe-worker.js', { type: 'module' });
+    const files = {};
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'progress') {
+        const p = data.data;
+        if (p.status === 'progress' && p.total) {
+          files[p.file] = { loaded: p.loaded, total: p.total };
+          const all = Object.values(files);
+          const loaded = all.reduce((s, f) => s + f.loaded, 0);
+          const total = all.reduce((s, f) => s + f.total, 0);
+          progressListener?.(`Downloading speech model (one-time) — ${Math.round(loaded / 1e6)} of ${Math.round(total / 1e6)} MB`);
+        }
+        return;
+      }
+      const job = jobs.get(data.id);
+      if (!job) return;
+      if (data.type === 'status') job.onStatus?.(data.status);
+      if (data.type === 'done') { jobs.delete(data.id); job.resolve(data.text); }
+      if (data.type === 'error') { jobs.delete(data.id); job.reject(new Error(data.message)); }
+    };
+    worker.onerror = e => {
+      for (const j of jobs.values()) j.reject(new Error(e.message || 'Speech model failed to load'));
+      jobs.clear(); worker = null;
+    };
+    return worker;
+  }
+
+  // Decode any audio the browser can play (webm, m4a, mp3, wav, voice memos…) into 16 kHz mono samples.
+  async function decodeTo16k(blob) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new Ctx();
+    let decoded;
+    try { decoded = await ctx.decodeAudioData(await blob.arrayBuffer()); }
+    finally { ctx.close?.(); }
+    const off = new OfflineAudioContext(1, Math.max(1, Math.ceil(decoded.duration * 16000)), 16000);
+    const src = off.createBufferSource();
+    src.buffer = decoded; src.connect(off.destination); src.start();
+    const rendered = await off.startRendering();
+    return { samples: rendered.getChannelData(0), duration: decoded.duration };
+  }
+
+  function transcribe(samples, onStatus) {
+    return new Promise((resolve, reject) => {
+      const id = ++jobSeq;
+      jobs.set(id, { resolve, reject, onStatus });
+      getWorker().postMessage({ id, audio: samples }, [samples.buffer]);
+    });
+  }
+
+  const blobToDataUrl = blob => new Promise((res, rej) => {
+    const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(blob);
+  });
+
+  // ---------- Voice: turn a transcript into form fields with Claude ----------
+  const ANTHROPIC_SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.3.0/+esm';
+  let anthropicClient = null, anthropicClientKey = null;
+
+  async function getAnthropic(apiKey) {
+    if (anthropicClient && anthropicClientKey === apiKey) return anthropicClient;
+    const { default: Anthropic } = await import(ANTHROPIC_SDK_URL);
+    // The key is the user's own, typed into Settings and kept in this browser only.
+    anthropicClient = new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
+    anthropicClientKey = apiKey;
+    return anthropicClient;
+  }
+
+  const EXTRACT_SYSTEM = `You fill in a personal apartment-hunting journal from a spoken recap. One or more people recorded their thoughts during or after touring an apartment; the transcript comes from automatic speech recognition, so expect small transcription errors and fix obvious ones (e.g. misheard numbers or place names) from context.
+
+Rules:
+- Use only what the speakers said. Use null for any field they did not mention, and empty arrays when nothing applies. Do not invent details.
+- price is the monthly rent in US dollars as a plain number. If they mention several units, use the one they seem to be considering.
+- visitDate: only if they say when they visited; resolve relative dates ("yesterday", "Saturday") against today's date, format YYYY-MM-DD.
+- rating: 1-5. Use a rating they state; otherwise infer it only when their overall feeling is clear (loved it ≈ 5, liked it ≈ 4, mixed ≈ 3, disappointed ≈ 2, hated it ≈ 1); otherwise null.
+- status: "Interested", "Maybe", "Applied", or "Pass" based on what they say they want to do; null if unclear.
+- requirements: for each item in the requirement list that they talk about, answer "yes" if the place has it, "no" if it doesn't, "unsure" if it came up without a clear answer. Leave out requirements they never mention. Match by meaning, not exact wording (e.g. "there's a washer and dryer in the unit" → "In-unit washer/dryer": yes).
+- likes / dislikes: short phrases (under 12 words) in plain language, one idea each.
+- notes: other useful facts as short lines starting with "- " (fees, deposits, move-in specials, lease terms, neighborhood, commute, the leasing agent, questions to follow up on). Empty string if nothing else.`;
+
+  function extractionSchema(reqs) {
+    const nullable = t => ({ type: [t, 'null'] });
+    return {
+      type: 'object',
+      additionalProperties: false,
+      required: ['name', 'address', 'price', 'beds', 'baths', 'sqft', 'visitDate', 'rating', 'status', 'requirements', 'likes', 'dislikes', 'notes'],
+      properties: {
+        name: nullable('string'),
+        address: nullable('string'),
+        price: nullable('number'),
+        beds: nullable('number'),
+        baths: nullable('number'),
+        sqft: nullable('number'),
+        visitDate: nullable('string'),
+        rating: nullable('integer'),
+        status: { anyOf: [{ type: 'string', enum: STATUSES }, { type: 'null' }] },
+        requirements: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['requirement', 'answer'],
+            properties: {
+              requirement: reqs.length ? { type: 'string', enum: reqs } : { type: 'string' },
+              answer: { type: 'string', enum: ['yes', 'no', 'unsure'] },
+            },
+          },
+        },
+        likes: { type: 'array', items: { type: 'string' } },
+        dislikes: { type: 'array', items: { type: 'string' } },
+        notes: { type: 'string' },
+      },
+    };
+  }
+
+  async function extractFromTranscript(transcript, reqs, apiKey) {
+    const client = await getAnthropic(apiKey);
+    const today = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+    const response = await client.beta.messages.create({
+      model: 'claude-opus-5-5',
+      max_tokens: 16000,
+      betas: ['server-side-fallback-2026-07-01'],
+      fallbacks: 'default',
+      output_config: { effort: 'medium', format: { type: 'json_schema', schema: extractionSchema(reqs) } },
+      system: EXTRACT_SYSTEM,
+      messages: [{
+        role: 'user',
+        content: `Today's date: ${today}\n\nMy requirement list:\n${reqs.map(r => `- ${r}`).join('\n') || '(none)'}\n\n<transcript>\n${transcript}\n</transcript>`,
+      }],
+    });
+    if (response.stop_reason === 'refusal') throw new Error('Claude declined to process this transcript.');
+    if (response.stop_reason === 'max_tokens') throw new Error('The response was cut off — try a shorter recording.');
+    const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+    return JSON.parse(text);
+  }
+
+  function friendlyApiError(err) {
+    const s = err?.status;
+    if (s === 401) return 'Your Anthropic API key was rejected. Check it in Settings.';
+    if (s === 429) return 'Rate limited by Anthropic — wait a moment and try again.';
+    if (s === 400 && /credit|billing/i.test(err.message)) return 'Your Anthropic account is out of credits.';
+    if (s >= 500 || s === 529) return 'Anthropic is busy right now — try again in a minute.';
+    return err?.message || 'Something went wrong.';
+  }
+
   // ---------- Router ----------
   const go = h => { location.hash = h; };
   window.addEventListener('hashchange', route);
@@ -286,6 +437,13 @@
 
       ${a.notes ? `<div class="panel"><h2>Notes</h2><div class="notes">${esc(a.notes)}</div></div>` : ''}
 
+      ${a.recordings?.length ? `<div class="panel"><h2>🎙 Recordings</h2>${a.recordings.map(r => `
+        <div class="rec-item">
+          <div class="muted">${esc(new Date(r.createdAt).toLocaleString())}${r.source ? ` · ${esc(r.source)}` : ''}</div>
+          ${r.audio ? `<audio controls preload="none" src="${esc(r.audio)}"></audio>` : ''}
+          ${r.transcript ? `<details><summary>Transcript</summary><p class="notes">${esc(r.transcript)}</p></details>` : ''}
+        </div>`).join('')}</div>` : ''}
+
       ${(a.photos?.length || listingImgs.length) ? `<div class="panel"><h2>Photos</h2><div class="photos">
         ${(a.photos || []).map(p => `<div class="photo"><img src="${esc(p.data)}" alt="" loading="lazy" /></div>`).join('')}
         ${listingImgs.map(u => `<div class="photo"><img src="${esc(u)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.remove()" /></div>`).join('')}
@@ -308,11 +466,35 @@
       visitDate: new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10), rating: 0, status: 'Interested',
       reqs: {}, likes: [], dislikes: [], notes: '', photos: [], coverId: null, createdAt: Date.now(),
     };
+    a.recordings ||= [];
+    let currentReqs = reqs;
     let dirty = false;
 
     app.innerHTML = `
       <p><a href="${existing ? `#/apt/${esc(a.id)}` : '#/'}">← Cancel</a></p>
       <h1>${existing ? 'Edit visit' : 'New visit'}</h1>
+
+      <div class="panel voice-panel">
+        <h2>🎙 Talk it through</h2>
+        <p class="muted">Record your thoughts (or import a voice memo) and the form below gets filled in for you. You can record more than once — each one adds to the visit.</p>
+        <div class="row">
+          <button type="button" class="btn primary" id="recBtn">● Record</button>
+          <label class="btn">⬆ Import audio<input type="file" id="audioIn" accept="audio/*,video/mp4,video/quicktime,.m4a,.mp3,.wav,.aac,.ogg,.webm" hidden /></label>
+          <span class="rec-timer" id="recTimer" hidden></span>
+        </div>
+        <div class="voice-status" id="voiceStatus" hidden></div>
+        <div id="transcriptBox" hidden>
+          <div class="field full" style="margin-top:12px">
+            <label for="transcript">Transcript (fix anything that was misheard, then fill)</label>
+            <textarea id="transcript" rows="5"></textarea>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <button type="button" class="btn primary" id="fillBtn">✨ Fill in the form</button>
+            <button type="button" class="btn" id="toNotesBtn">Add transcript to notes</button>
+          </div>
+        </div>
+        <div id="recList"></div>
+      </div>
 
       <div class="panel">
         <h2>Listing link</h2>
@@ -422,7 +604,7 @@
       });
     };
     drawReqs(reqs);
-    $('#editReqsLink').onclick = e => { e.preventDefault(); openSettings(newReqs => drawReqs(newReqs)); };
+    $('#editReqsLink').onclick = e => { e.preventDefault(); openSettings(newReqs => { currentReqs = newReqs; drawReqs(newReqs); }); };
 
     // Likes / dislikes
     const listEditor = (key, ulId, inId, btnId) => {
@@ -438,9 +620,183 @@
       $(btnId).onclick = add;
       $(inId).addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); add(); } });
       draw();
+      return draw;
     };
-    listEditor('likes', '#likesList', '#likeIn', '#likeAdd');
-    listEditor('dislikes', '#dislikesList', '#dislikeIn', '#dislikeAdd');
+    const drawLikes = listEditor('likes', '#likesList', '#likeIn', '#likeAdd');
+    const drawDislikes = listEditor('dislikes', '#dislikesList', '#dislikeIn', '#dislikeAdd');
+
+    // ----- Voice: record / import → transcribe → fill -----
+    const status = (html, kind = '') => {
+      const el = $('#voiceStatus');
+      if (!html) { el.hidden = true; return; }
+      el.hidden = false; el.className = `voice-status ${kind}`; el.innerHTML = html;
+    };
+    let busy = false;
+    let lastRecordingId = null;
+
+    const drawRecordings = () => {
+      $('#recList').innerHTML = a.recordings.length ? `<h3 class="rec-heading">Recordings</h3>` + a.recordings.map(r => `
+        <div class="rec-item" data-id="${esc(r.id)}">
+          <div class="row">
+            <span class="muted">${esc(new Date(r.createdAt).toLocaleString())}${r.source ? ` · ${esc(r.source)}` : ''}</span>
+            <div class="spacer"></div>
+            <button type="button" class="btn small ghost rec-del">Remove</button>
+          </div>
+          ${r.audio ? `<audio controls preload="none" src="${esc(r.audio)}"></audio>` : ''}
+          ${r.transcript ? `<details><summary>Transcript</summary><p class="notes">${esc(r.transcript)}</p></details>` : ''}
+        </div>`).join('') : '';
+      $('#recList').querySelectorAll('.rec-del').forEach(b => b.onclick = () => {
+        const id = b.closest('.rec-item').dataset.id;
+        if (!confirm('Remove this recording? (Anything already filled in stays.)')) return;
+        a.recordings = a.recordings.filter(r => r.id !== id); dirty = true; drawRecordings();
+      });
+    };
+    drawRecordings();
+
+    const flash = el => { el.classList.remove('filled'); void el.offsetWidth; el.classList.add('filled'); };
+
+    const applyExtraction = x => {
+      let n = 0;
+      const setInput = (id, val, onlyIfEmpty = false) => {
+        if (val === null || val === undefined || val === '') return;
+        const el = $('#' + id);
+        if (onlyIfEmpty && el.value.trim()) return;
+        if (String(el.value) === String(val)) return;
+        el.value = val; flash(el); n++;
+      };
+      setInput('name', x.name, true);
+      setInput('address', x.address, true);
+      setInput('price', x.price);
+      setInput('beds', x.beds);
+      setInput('baths', x.baths);
+      setInput('sqft', x.sqft);
+      if (x.visitDate && /^\d{4}-\d{2}-\d{2}$/.test(x.visitDate)) setInput('visitDate', x.visitDate);
+      if (Number.isInteger(x.rating) && x.rating !== a.rating) { a.rating = Math.min(5, Math.max(1, x.rating)); drawStars(); flash($('#starInput')); n++; }
+      if (x.status && STATUSES.includes(x.status) && x.status !== a.status) { a.status = x.status; drawStatus(); flash($('#statusPills')); n++; }
+      for (const { requirement, answer } of x.requirements || []) {
+        if (!currentReqs.includes(requirement)) continue;
+        if (answer === 'unsure' && a.reqs[requirement]) continue;
+        if (a.reqs[requirement] !== answer) { a.reqs[requirement] = answer; n++; }
+      }
+      drawReqs(currentReqs);
+      const addUnique = (key, items) => {
+        const seen = new Set(a[key].map(s => s.toLowerCase()));
+        for (const it of items || []) {
+          const v = String(it).trim();
+          if (v && !seen.has(v.toLowerCase())) { a[key].push(v); seen.add(v.toLowerCase()); n++; }
+        }
+      };
+      addUnique('likes', x.likes); addUnique('dislikes', x.dislikes);
+      drawLikes(); drawDislikes();
+      const extra = (x.notes || '').trim();
+      if (extra && !$('#notes').value.includes(extra)) {
+        $('#notes').value = ($('#notes').value.trim() ? $('#notes').value.trim() + '\n\n' : '') + extra;
+        flash($('#notes')); n++;
+      }
+      dirty = true;
+      return n;
+    };
+
+    const fill = async () => {
+      const transcript = $('#transcript').value.trim();
+      if (!transcript) { toast('Nothing to fill from yet'); return; }
+      const key = await store.getSetting('anthropicKey');
+      if (!key) {
+        status(`Transcript ready. To auto-fill the form, add your Anthropic API key in <a href="#" id="openKey">Settings</a> — or tap “Add transcript to notes”.`, 'warn');
+        $('#openKey').onclick = e => { e.preventDefault(); openSettings(newReqs => { currentReqs = newReqs; drawReqs(newReqs); }); };
+        return;
+      }
+      busy = true; $('#fillBtn').disabled = true;
+      status('<span class="spinner"></span> Reading your notes and filling in the form…');
+      try {
+        const x = await extractFromTranscript(transcript, currentReqs, key);
+        const n = applyExtraction(x);
+        status(n ? `✓ Filled in ${n} item${n === 1 ? '' : 's'} — they're highlighted below. Review, then save.` : 'Nothing new to fill in from that recording.', 'ok');
+      } catch (err) {
+        console.error(err);
+        status(esc(friendlyApiError(err)) + ' Your transcript is kept above.', 'err');
+      } finally { busy = false; $('#fillBtn').disabled = false; }
+    };
+
+    const processAudio = async (blob, source) => {
+      if (busy) return;
+      busy = true;
+      $('#transcriptBox').hidden = true;
+      try {
+        status('<span class="spinner"></span> Preparing audio…');
+        const { samples, duration } = await decodeTo16k(blob);
+        if (duration < 1) throw new Error('That recording is too short.');
+        const rec = { id: uid(), createdAt: Date.now(), source, transcript: '' };
+        // Keep the audio with the visit unless it's very large.
+        if (blob.size < 15e6) rec.audio = await blobToDataUrl(blob);
+        a.recordings.push(rec); lastRecordingId = rec.id; dirty = true; drawRecordings();
+
+        const mins = Math.max(1, Math.round(duration / 60));
+        progressListener = msg => status(`<span class="spinner"></span> ${esc(msg)}`);
+        status('<span class="spinner"></span> Loading speech model…');
+        const text = await transcribe(samples, st => {
+          if (st === 'transcribing') status(`<span class="spinner"></span> Transcribing ${mins > 1 ? `${mins} minutes of` : ''} audio… this can take a little while.`);
+        });
+        progressListener = null;
+        if (!text) throw new Error("Couldn't make out any speech in that audio.");
+        rec.transcript = text; drawRecordings();
+        $('#transcript').value = text;
+        $('#transcriptBox').hidden = false;
+        busy = false;
+        await fill();
+      } catch (err) {
+        console.error(err);
+        status(esc(err?.message?.includes('decode') ? "That file couldn't be read as audio. Try an .m4a, .mp3 or .wav file." : (err.message || 'Transcription failed.')), 'err');
+      } finally { busy = false; progressListener = null; }
+    };
+
+    $('#fillBtn').onclick = () => {
+      // If the transcript was edited, keep the edited version with the recording.
+      const r = a.recordings.find(r => r.id === lastRecordingId);
+      if (r) { r.transcript = $('#transcript').value.trim(); drawRecordings(); }
+      fill();
+    };
+    $('#toNotesBtn').onclick = () => {
+      const t = $('#transcript').value.trim();
+      if (!t) return;
+      $('#notes').value = ($('#notes').value.trim() ? $('#notes').value.trim() + '\n\n' : '') + t;
+      flash($('#notes')); dirty = true; toast('Added to notes');
+    };
+    $('#audioIn').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) processAudio(f, f.name); };
+
+    // Recording
+    let mediaRec = null, recStart = 0, recTick = null;
+    const stopTracks = () => mediaRec?.stream.getTracks().forEach(t => t.stop());
+    $('#recBtn').onclick = async () => {
+      if (mediaRec && mediaRec.state === 'recording') { mediaRec.stop(); return; }
+      if (busy) return;
+      if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { toast("This browser can't record audio. Try importing a voice memo instead."); return; }
+      let stream;
+      try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+      catch { status('Microphone access was blocked. Allow it in your browser settings, or import a voice memo instead.', 'err'); return; }
+      const mime = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg'].find(m => MediaRecorder.isTypeSupported?.(m));
+      mediaRec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      const chunks = [];
+      mediaRec.ondataavailable = e => e.data.size && chunks.push(e.data);
+      mediaRec.onstop = () => {
+        clearInterval(recTick); stopTracks();
+        $('#recTimer').hidden = true;
+        $('#recBtn').textContent = '● Record'; $('#recBtn').classList.remove('recording');
+        const blob = new Blob(chunks, { type: mediaRec.mimeType || 'audio/webm' });
+        mediaRec = null;
+        processAudio(blob, 'Recorded');
+      };
+      mediaRec.start(1000);
+      recStart = Date.now();
+      $('#recBtn').textContent = '■ Stop'; $('#recBtn').classList.add('recording');
+      $('#recTimer').hidden = false;
+      const tick = () => { const s = Math.floor((Date.now() - recStart) / 1000); $('#recTimer').textContent = `🔴 ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+      tick(); recTick = setInterval(tick, 500);
+      status('Recording… talk about what you liked, what you didn\'t, the price, and whether it has what you need. Tap Stop when done.');
+      // Make sure the mic is released if the user leaves the page mid-recording.
+      const onLeave = () => { if (mediaRec) { mediaRec.onstop = null; mediaRec.stop(); stopTracks(); clearInterval(recTick); } window.removeEventListener('hashchange', onLeave); };
+      window.addEventListener('hashchange', onLeave);
+    };
 
     // Photos
     const drawPhotos = () => {
@@ -514,6 +870,7 @@
   async function openSettings(cb) {
     settingsCb = cb || null;
     $('#reqText').value = (await getReqs()).join('\n');
+    $('#apiKey').value = (await store.getSetting('anthropicKey')) || '';
     dlg.showModal();
   }
   $('#settingsBtn').onclick = () => openSettings();
@@ -521,7 +878,8 @@
     if (dlg.returnValue !== 'save') return;
     const list = [...new Set($('#reqText').value.split('\n').map(s => s.trim()).filter(Boolean))];
     await store.setSetting('requirements', list);
-    toast('Requirements saved');
+    await store.setSetting('anthropicKey', $('#apiKey').value.trim());
+    toast('Settings saved');
     if (settingsCb) settingsCb(list); else route();
   });
 
